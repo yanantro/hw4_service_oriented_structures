@@ -1,0 +1,50 @@
+@startuml v1-seq-failover
+title Вариант 1. Сценарий failover (push не подтверждён, основной SMS-провайдер недоступен)
+autonumber
+
+queue "Kafka" as kafka
+participant "Push Worker" as pushw
+participant "Push-провайдер" as pushp
+participant "Delivery Checker" as checker
+database "Redis" as redis
+participant "SMS Worker" as smsw
+participant "SMS-провайдер A" as smsa
+participant "SMS-провайдер B" as smsb
+participant "Receipt Collector" as rc
+actor "Клиент" as client
+
+kafka -> pushw : push.send
+pushw -> redis : SETNX sent:{id}:push
+pushw -> pushp : отправить push
+pushp --> pushw : принято
+pushw -> kafka : push.check.10s
+note over pushp, client : Телефон без интернета,\nподтверждение от приложения не приходит
+
+... 10 секунд ...
+kafka -> checker : push.check.10s
+checker -> redis : GET status:{id}
+redis --> checker : SENT (нет подтверждения)
+checker -> kafka : sms.send (следующий канал в цепочке)
+
+kafka -> smsw : sms.send
+smsw -> redis : SETNX sent:{id}:sms
+redis --> smsw : OK
+smsw -> smsa : отправить SMS
+smsa --> smsw : таймаут 2 с / ошибка 5xx
+note over smsw : Circuit breaker для провайдера A\nсчитает ошибки. Повтор через провайдера B
+smsw -> smsb : отправить SMS
+smsb --> smsw : принято (message_id)
+smsw -> kafka : sms.check.120s
+smsw -> kafka : delivery.events (SENT_SMS)
+
+smsb -> client : SMS
+smsb -> rc : отчёт о доставке (DELIVERED)
+rc -> redis : SET status:{id} = DELIVERED
+rc -> kafka : delivery.events (DELIVERED_SMS)
+
+... до 120 секунд ...
+kafka -> checker : sms.check.120s
+checker -> redis : GET status:{id}
+redis --> checker : DELIVERED
+note over checker : Доставлено по SMS, email не нужен
+@enduml

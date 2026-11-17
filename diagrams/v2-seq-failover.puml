@@ -1,0 +1,54 @@
+@startuml v2-seq-failover
+title Вариант 2. Сценарий failover (push не подтверждён, основной SMS-провайдер недоступен)
+autonumber
+
+queue "Kafka" as kafka
+participant "Delivery Orchestrator" as orch
+database "Delivery DB\n(PostgreSQL)" as pg
+participant "SMS Adapter" as smsa
+database "Redis" as redis
+participant "SMS-провайдер A" as pa
+participant "SMS-провайдер B" as pb
+participant "Receipt Collector" as rc
+actor "Клиент" as client
+
+note over orch, pg : Push отправлен, state = WAIT_PUSH_ACK,\nподтверждение от приложения не пришло
+
+... 10 секунд ...
+orch -> pg : select ... from timers\nwhere fire_at <= now()\nfor update skip locked
+pg --> orch : таймер уведомления
+group одна транзакция
+  orch -> pg : update ... set state = WAIT_SMS_DLR\nwhere state = WAIT_PUSH_ACK
+  pg --> orch : 1 строка (статус не менялся)
+  orch -> pg : insert attempt (sms, 2)
+  orch -> pg : insert timer (now + 120 с)
+  orch -> pg : insert outbox (send.sms)
+end
+orch -> kafka : send.sms (outbox relay)
+orch -> kafka : delivery.events (FAILOVER_TO_SMS)
+
+kafka -> smsa : send.sms
+smsa -> redis : SETNX attempt:{attempt_id}
+redis --> smsa : OK
+smsa -> pa : отправить SMS
+pa --> smsa : таймаут 2 с / ошибка 5xx
+note over smsa : Circuit breaker для провайдера A.\nПовтор того же attempt_id через провайдера B
+smsa -> pb : отправить SMS (client_message_id = attempt_id)
+pb --> smsa : принято (message_id)
+smsa -> kafka : receipts (ACCEPTED, sms, провайдер B)
+
+pb -> client : SMS
+pb -> rc : отчёт о доставке (DELIVERED)
+rc -> kafka : receipts (DELIVERED, sms)
+kafka -> orch : receipts
+orch -> pg : update ... set state = DELIVERED\nwhere state = WAIT_SMS_DLR
+orch -> pg : delete timer
+orch -> kafka : delivery.events (DELIVERED_SMS)
+
+alt push-подтверждение пришло позже
+  rc -> kafka : receipts (DELIVERED, push)
+  kafka -> orch : receipts
+  orch -> pg : state уже DELIVERED,\nпишем в историю "позднее подтверждение"
+  note over orch : Новых отправок нет
+end
+@enduml

@@ -1,0 +1,57 @@
+@startuml v2-c4-container
+!include <C4/C4_Container>
+
+title Вариант 2. Центральный оркестратор доставки. C4 Container
+
+Person(client, "Клиент", "Мобильное приложение банка")
+Person(support, "Сотрудник поддержки", "Смотрит историю доставки")
+System_Ext(src, "Сервисы-источники", "Платежи, переводы, карты")
+System_Ext(pushp, "Push-провайдеры", "APNs, FCM, RuStore Push")
+System_Ext(smsp, "SMS-провайдеры", "Провайдер A (основной), провайдер B (резервный)")
+System_Ext(emailp, "Email-провайдер", "SMTP / HTTP API")
+
+System_Boundary(np, "Notification Platform: подсистема гарантированной доставки") {
+  Container(api, "Notification API", "Go", "Принимает уведомления, пишет в Kafka, отвечает 202")
+  ContainerQueue(kafka, "Kafka", "Apache Kafka, 3 брокера, RF=3", "transactional.in, send.push, send.sms, send.email, receipts, delivery.events")
+  Container(orch, "Delivery Orchestrator", "Go, 6+ экземпляров", "Машина состояний доставки: выбор канала, таймеры, failover, outbox")
+  ContainerDb(pg, "Delivery DB", "PostgreSQL 16, Patroni, 2 шарда, синхронная реплика", "Уведомления, попытки, таймеры, outbox, история статусов")
+  Container(prefs, "Preferences Service", "Go, PostgreSQL", "Настройки клиента: основной канал, отключённые типы")
+  ContainerDb(redis, "Redis Cluster", "Redis", "Кэш настроек, ключи дедупликации попыток, TTL 24 ч")
+  Container(pusha, "Push Adapter", "Go", "Отправляет push")
+  Container(smsa, "SMS Adapter", "Go", "Отправляет SMS, переключает провайдеров (circuit breaker)")
+  Container(emaila, "Email Adapter", "Go", "Отправляет email")
+  Container(rc, "Receipt Collector", "Go", "Принимает подтверждения от приложения и отчёты о доставке от провайдеров")
+  Container(status, "Status API", "Go", "История доставки для поддержки и сервисов-источников")
+  ContainerDb(ch, "ClickHouse", "ClickHouse", "События доставки, отчёты, архив старше 30 дней")
+}
+
+System_Ext(obs, "Observability", "OpenTelemetry, Jaeger, Prometheus, Grafana")
+
+Rel(src, api, "Отправляет уведомление", "HTTPS")
+Rel(api, kafka, "Пишет", "acks=all")
+Rel(kafka, orch, "transactional.in, receipts")
+Rel(orch, pg, "Состояние, таймеры, outbox", "SQL")
+Rel(orch, prefs, "Читает настройки", "gRPC")
+Rel(prefs, redis, "Кэш")
+Rel(orch, kafka, "Команды send.*, события delivery.events")
+Rel(kafka, pusha, "send.push")
+Rel(kafka, smsa, "send.sms")
+Rel(kafka, emaila, "send.email")
+Rel(pusha, redis, "SETNX attempt_id")
+Rel(smsa, redis, "SETNX attempt_id")
+Rel(emaila, redis, "SETNX attempt_id")
+Rel(pusha, pushp, "Отправляет", "HTTPS")
+Rel(smsa, smsp, "Отправляет", "HTTPS")
+Rel(emaila, emailp, "Отправляет", "SMTP / HTTPS")
+Rel(pushp, client, "Push")
+Rel(client, rc, "Подтверждение получения push", "HTTPS")
+Rel(smsp, rc, "Отчёт о доставке SMS", "HTTPS webhook")
+Rel(rc, kafka, "receipts")
+Rel(kafka, ch, "delivery.events")
+Rel(support, status, "Смотрит статус", "HTTPS")
+Rel(status, pg, "Текущий статус", "SQL")
+Rel(status, ch, "История старше 30 дней", "SQL")
+Rel(np, obs, "Метрики, трейсы, логи")
+
+SHOW_LEGEND()
+@enduml

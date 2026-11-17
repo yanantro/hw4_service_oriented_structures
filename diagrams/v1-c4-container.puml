@@ -1,0 +1,51 @@
+@startuml v1-c4-container
+!include <C4/C4_Container>
+
+title Вариант 1. Хореография на Kafka. C4 Container
+
+Person(client, "Клиент", "Мобильное приложение банка")
+System_Ext(src, "Сервисы-источники", "Платежи, переводы, карты")
+System_Ext(pushp, "Push-провайдеры", "APNs, FCM, RuStore Push")
+System_Ext(smsp, "SMS-провайдеры", "Провайдер A (основной), провайдер B (резервный)")
+System_Ext(emailp, "Email-провайдер", "SMTP / HTTP API")
+
+System_Boundary(np, "Notification Platform: подсистема гарантированной доставки") {
+  Container(api, "Notification API", "Go", "Принимает уведомления, проверяет idempotency key, пишет в Kafka")
+  ContainerQueue(kafka, "Kafka", "Apache Kafka, 3 брокера", "transactional.in, push.send, sms.send, email.send, push.check.10s, sms.check.120s, delivery.events")
+  Container(router, "Router", "Go", "Читает настройки клиента, строит цепочку каналов и кладёт её в сообщение")
+  Container(prefs, "Preferences Service", "Go, PostgreSQL", "Настройки клиента: основной канал, отключённые типы")
+  Container(pushw, "Push Worker", "Go", "Отправляет push, ставит отложенную проверку")
+  Container(smsw, "SMS Worker", "Go", "Отправляет SMS, переключает провайдеров (circuit breaker)")
+  Container(emailw, "Email Worker", "Go", "Отправляет email")
+  Container(checker, "Delivery Checker", "Go", "Читает отложенные проверки, смотрит статус, отправляет в следующий канал")
+  Container(rc, "Receipt Collector", "Go", "Принимает подтверждения от приложения и отчёты о доставке от провайдеров")
+  ContainerDb(redis, "Redis Cluster", "Redis, AOF", "Статусы доставки, ключи дедупликации, TTL 24 ч")
+  ContainerDb(ch, "ClickHouse", "ClickHouse", "История событий доставки")
+}
+
+System_Ext(obs, "Observability", "OpenTelemetry, Jaeger, Prometheus, Grafana")
+
+Rel(src, api, "Отправляет уведомление", "HTTPS")
+Rel(api, redis, "Проверяет idempotency key")
+Rel(api, kafka, "Пишет", "acks=all")
+Rel(kafka, router, "transactional.in")
+Rel(router, prefs, "Читает настройки", "gRPC")
+Rel(router, kafka, "Пишет в топик первого канала")
+Rel(kafka, pushw, "push.send")
+Rel(kafka, smsw, "sms.send")
+Rel(kafka, emailw, "email.send")
+Rel(pushw, pushp, "Отправляет", "HTTPS")
+Rel(smsw, smsp, "Отправляет", "HTTPS")
+Rel(emailw, emailp, "Отправляет", "SMTP / HTTPS")
+Rel(pushp, client, "Push")
+Rel(client, rc, "Подтверждение получения push", "HTTPS")
+Rel(smsp, rc, "Отчёт о доставке SMS", "HTTPS webhook")
+Rel(rc, redis, "Пишет статус DELIVERED")
+Rel(kafka, checker, "push.check.10s, sms.check.120s")
+Rel(checker, redis, "Читает статус")
+Rel(checker, kafka, "Пишет в топик следующего канала")
+Rel(kafka, ch, "delivery.events")
+Rel(np, obs, "Метрики, трейсы, логи")
+
+SHOW_LEGEND()
+@enduml

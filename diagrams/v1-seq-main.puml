@@ -1,0 +1,46 @@
+@startuml v1-seq-main
+title Вариант 1. Основной сценарий доставки (push подтверждён)
+autonumber
+
+participant "Сервис платежей" as src
+participant "Notification API" as api
+database "Redis" as redis
+queue "Kafka" as kafka
+participant "Router" as router
+participant "Preferences Service" as prefs
+participant "Push Worker" as pushw
+participant "Push-провайдер" as pushp
+actor "Приложение клиента" as app
+participant "Receipt Collector" as rc
+participant "Delivery Checker" as checker
+
+src -> api : POST /v1/notifications\n(idempotency_key, user_id, шаблон, данные)
+api -> redis : SETNX idem:{idempotency_key}
+redis --> api : OK (новый ключ)
+api -> kafka : transactional.in (acks=all)
+kafka --> api : записано
+api --> src : 202 Accepted (notification_id)
+
+kafka -> router : transactional.in
+router -> prefs : настройки клиента
+prefs --> router : основной канал push, есть push-токен
+router -> kafka : push.send\n(цепочка: push, sms, email)
+
+kafka -> pushw : push.send
+pushw -> redis : SETNX sent:{id}:push
+pushw -> pushp : отправить push
+pushp --> pushw : принято
+pushw -> kafka : push.check.10s (id, цепочка)
+pushw -> kafka : delivery.events (SENT_PUSH)
+
+pushp -> app : push
+app -> rc : POST /v1/ack (notification_id)
+rc -> redis : SET status:{id} = DELIVERED
+rc -> kafka : delivery.events (DELIVERED_PUSH)
+
+... через 10 секунд ...
+kafka -> checker : push.check.10s
+checker -> redis : GET status:{id}
+redis --> checker : DELIVERED
+note over checker : Доставлено, дальше ничего не делаем
+@enduml

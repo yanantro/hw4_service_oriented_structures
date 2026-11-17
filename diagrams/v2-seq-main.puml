@@ -1,0 +1,48 @@
+@startuml v2-seq-main
+title Вариант 2. Основной сценарий доставки (push подтверждён)
+autonumber
+
+participant "Сервис платежей" as src
+participant "Notification API" as api
+queue "Kafka" as kafka
+participant "Delivery Orchestrator" as orch
+database "Delivery DB\n(PostgreSQL)" as pg
+participant "Preferences Service" as prefs
+participant "Push Adapter" as pusha
+database "Redis" as redis
+participant "Push-провайдер" as pushp
+actor "Приложение клиента" as app
+participant "Receipt Collector" as rc
+
+src -> api : POST /v1/notifications\n(idempotency_key, user_id, шаблон, данные)
+api -> kafka : transactional.in (key = user_id, acks=all)
+kafka --> api : записано
+api --> src : 202 Accepted (notification_id)
+
+kafka -> orch : transactional.in
+orch -> pg : insert notification\non conflict (idempotency_key) do nothing
+orch -> prefs : настройки клиента (из кэша)
+prefs --> orch : основной канал push, есть push-токен
+group одна транзакция
+  orch -> pg : insert attempt (push, 1)
+  orch -> pg : state = WAIT_PUSH_ACK
+  orch -> pg : insert timer (now + 10 с)
+  orch -> pg : insert outbox (send.push)
+end
+orch -> kafka : send.push (outbox relay)
+
+kafka -> pusha : send.push
+pusha -> redis : SETNX attempt:{attempt_id}
+redis --> pusha : OK
+pusha -> pushp : отправить push
+pushp --> pusha : принято
+pusha -> kafka : receipts (ACCEPTED, push)
+
+pushp -> app : push
+app -> rc : POST /v1/ack (notification_id)
+rc -> kafka : receipts (DELIVERED, push)
+kafka -> orch : receipts
+orch -> pg : update ... set state = DELIVERED\nwhere state = WAIT_PUSH_ACK
+orch -> pg : delete timer
+orch -> kafka : delivery.events (DELIVERED_PUSH)
+@enduml
